@@ -821,3 +821,57 @@ async def update_job(
 
     await db.commit()
     return {"id": job.id, "status": job.status}
+
+
+@router.post("/sync-jobs/{project_id}")
+async def sync_jobs(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reconcile DB job records against the Celery result backend.
+
+    Call this after an unexpected exe shutdown to recover correct job
+    statuses.  Jobs stuck in 'pending' or 'started' are updated to match
+    what Celery actually knows about the task.
+    """
+    await get_owned_project(project_id, current_user, db)
+
+    q = select(TrainingJob).where(
+        TrainingJob.project_id == project_id,
+        TrainingJob.status.in_(["pending", "started"]),
+    )
+    result = await db.execute(q)
+    stale_jobs = result.scalars().all()
+
+    updated = []
+    for job in stale_jobs:
+        celery_result = AsyncResult(job.id, app=celery_app)
+        state = celery_result.state
+
+        if state == "SUCCESS":
+            job.status = "success"
+            job.finished_at = job.finished_at or datetime.utcnow()
+        elif state == "FAILURE":
+            job.status = "failure"
+            job.finished_at = job.finished_at or datetime.utcnow()
+            job.result_meta = _sanitize_meta({
+                **(job.result_meta or {}),
+                "error": str(celery_result.result),
+            })
+        elif state == "STARTED":
+            job.status = "started"
+        elif state == "REVOKED":
+            job.status = "failure"
+            job.finished_at = job.finished_at or datetime.utcnow()
+            job.result_meta = _sanitize_meta({
+                **(job.result_meta or {}),
+                "error": "Task was revoked",
+            })
+        # PENDING means Celery has no record — either never started or
+        # result expired; leave as-is so the UI can still see it.
+
+        updated.append({"id": job.id, "old_status": job.status, "celery_state": state})
+
+    await db.commit()
+    return {"synced": len(updated), "jobs": updated}

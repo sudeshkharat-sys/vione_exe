@@ -68,7 +68,7 @@ def _preprocess_for_inspection(src_path: Path, dst_path: Path) -> None:
         shutil.copy(src_path, dst_path)
         return
 
-    # ── Stage 1: moderate CLAHE on L channel ─────────────────────
+    # ── Stage 1: moderate CLAHE on L channel ────────────────────
     # clipLimit=3.0 + larger tiles (8×8): enhances local contrast without
     # flattening the whole image into grey.
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
@@ -84,7 +84,7 @@ def _preprocess_for_inspection(src_path: Path, dst_path: Path) -> None:
     lut = np.array([(i / 255.0) ** 1.3 * 255 for i in range(256)], dtype=np.uint8)
     out = cv2.LUT(out, lut)
 
-    # ── Stage 3: unsharp mask sharpening ─────────────────────────
+    # ── Stage 3: unsharp mask sharpening ────────────────────────
     # Crispens the hard clip-to-rubber boundary.
     blurred = cv2.GaussianBlur(out, (0, 0), sigmaX=2.0)
     out = cv2.addWeighted(out, 1.4, blurred, -0.4, 0)
@@ -293,6 +293,10 @@ def _build_yolo_dataset(img_rows, anns_by_image, classes, project_id,
     """
     Build a YOLO dataset directory with proper train / val / test splits.
 
+    Always starts from a clean directory: any leftover files from a
+    previously interrupted run are removed first to prevent stale images
+    or label files contaminating the new split.
+
     Directory layout
     ----------------
     temp_dataset_{project_id}/
@@ -303,6 +307,10 @@ def _build_yolo_dataset(img_rows, anns_by_image, classes, project_id,
         data.yaml
     """
     dataset_path = Path(f"./temp_dataset_{project_id}")
+    # Remove any leftover directory from a previously interrupted run so
+    # stale images / labels from a different split cannot contaminate this run.
+    if dataset_path.exists():
+        shutil.rmtree(dataset_path, ignore_errors=True)
     dataset_path.mkdir(exist_ok=True)
 
     train_imgs, val_imgs, test_imgs = _split_images(
@@ -347,6 +355,27 @@ def _build_yolo_dataset(img_rows, anns_by_image, classes, project_id,
         yaml.dump(data_yaml, f)
 
     return dataset_path, len(train_imgs), len(val_imgs), len(test_imgs)
+
+
+def _sync_job_status(task_id: str, status: str, result_meta: dict = None) -> None:
+    """Update the TrainingJob DB record to match the current Celery task state.
+
+    Called at the start of each training task so that jobs whose DB record
+    was left in 'pending' after an unexpected exe shutdown are corrected
+    before the task produces any new progress updates.
+    """
+    try:
+        db = StateDBConnector()
+        with db.get_session() as conn:
+            meta_json = json.dumps(result_meta or {})
+            db.execute_query(
+                conn,
+                "UPDATE training_jobs SET status = :status, result_meta = :meta "
+                "WHERE id = :task_id AND status IN ('pending', 'started')",
+                {"status": status, "meta": meta_json, "task_id": task_id},
+            )
+    except Exception:
+        pass  # DB sync is best-effort; don't block training
 
 
 def _make_epoch_callback(celery_task, total_epochs, epoch_history, epoch_start_times):
@@ -402,9 +431,9 @@ def _make_epoch_callback(celery_task, total_epochs, epoch_history, epoch_start_t
     return on_fit_epoch_end
 
 
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 #  Seed Training Task
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 
 @celery_app.task(name="app.tasks.training.train_seed_model", bind=True)
 def train_seed_model(
@@ -427,9 +456,12 @@ def train_seed_model(
     3. Training  — YOLO model.train()
     4. Cleanup   — copy seed_best.pt, remove temp dataset
     """
+    # Sync any stale DB job record left over from a previous interrupted run
+    _sync_job_status(self.request.id, "started")
+
     db = StateDBConnector()
 
-    # ── Phase 1: DB reads ────────────────────────────────────────
+    # ── Phase 1: DB reads ──────────────────────────────────────────
     with db.get_session() as conn:
         proj, classes, img_rows, ann_rows = _fetch_training_data(
             db, conn, project_id, status_filter="annotated"
@@ -442,13 +474,13 @@ def train_seed_model(
 
     anns_by_image = _group_annotations(ann_rows)
 
-    # ── Phase 2: Build dataset ───────────────────────────────────
+    # ── Phase 2: Build dataset ────────────────────────────────────────
     dataset_path, n_train, n_val, n_test = _build_yolo_dataset(
         img_rows, anns_by_image, classes, project_id,
         preprocess=preprocess, task=self,
     )
 
-    # ── Phase 3: Train ───────────────────────────────────────────
+    # ── Phase 3: Train ──────────────────────────────────────────────
     total_epochs   = epochs
     epoch_history  = []
     epoch_start_times = []
@@ -511,7 +543,7 @@ def train_seed_model(
         workers=0,           # Celery workers are daemonic — cannot spawn DataLoader subprocesses
     )
 
-    # ── Phase 4: Persist + cleanup ───────────────────────────────
+    # ── Phase 4: Persist + cleanup ─────────────────────────────────────────
     best_model_path = results.save_dir / "weights" / "best.pt"
     target_path = settings.model_dir / project_id / "seed_best.pt"
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -530,9 +562,9 @@ def train_seed_model(
     }
 
 
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 #  Main Training Task
-# ══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 
 @celery_app.task(name="app.tasks.training.train_main_model", bind=True)
 def train_main_model(
@@ -557,9 +589,12 @@ def train_main_model(
     3. Training  — YOLO model.train()
     4. Cleanup   — copy main_best.pt, remove temp dataset
     """
+    # Sync any stale DB job record left over from a previous interrupted run
+    _sync_job_status(self.request.id, "started")
+
     db = StateDBConnector()
 
-    # ── Phase 1: DB reads ────────────────────────────────────────
+    # ── Phase 1: DB reads ──────────────────────────────────────────
     with db.get_session() as conn:
         proj, classes, img_rows, ann_rows = _fetch_training_data(
             db, conn, project_id, status_filter="annotated"
@@ -581,13 +616,13 @@ def train_main_model(
 
     anns_by_image = _group_annotations(ann_rows)
 
-    # ── Phase 2: Build dataset ───────────────────────────────────
+    # ── Phase 2: Build dataset ────────────────────────────────────────
     dataset_path, n_train, n_val, n_test = _build_yolo_dataset(
         img_rows, anns_by_image, classes, f"{project_id}_main",
         preprocess=preprocess, task=self,
     )
 
-    # ── Phase 3: Train ───────────────────────────────────────────
+    # ── Phase 3: Train ──────────────────────────────────────────────
     total_epochs   = epochs
     epoch_history  = []
     epoch_start_times = []
@@ -652,7 +687,7 @@ def train_main_model(
         workers=0,           # Celery workers are daemonic — cannot spawn DataLoader subprocesses
     )
 
-    # ── Phase 4: Persist + cleanup ───────────────────────────────
+    # ── Phase 4: Persist + cleanup ─────────────────────────────────────────
     best_model_path = results.save_dir / "weights" / "best.pt"
     target_path = settings.model_dir / project_id / "main_best.pt"
     target_path.parent.mkdir(parents=True, exist_ok=True)
