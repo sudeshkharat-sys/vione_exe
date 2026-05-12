@@ -1,0 +1,16 @@
+{
+  "files": {
+    "main.css": "/static/css/main.0a7c5a8d.css",
+    "main.js": "/static/js/main.0038f6cb.js",
+    "static/js/453.03346f77.chunk.js": "/static/js/453.03346f77.chunk.js",
+    "static/media/street_cam.jpg": "/static/media/street_cam.7db0bacdf5e4ebe6f858.jpg",
+    "index.html": "/index.html",
+    "main.0a7c5a8d.css.map": "/static/css/main.0a7c5a8d.css.map",
+    "main.0038f6cb.js.map": "/static/js/main.0038f6cb.js.map",
+    "453.03346f77.chunk.js.map": "/static/js/453.03346f77.chunk.js.map"
+  },
+  "entrypoints": [
+    "static/css/main.0a7c5a8d.css",
+    "static/js/main.0038f6cb.js"
+  ]
+}
