@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
+import asyncio
 import base64, io, cv2, numpy as np
 from ..tasks.training import train_seed_model, train_main_model
 from ..tasks.auto_annotate import auto_annotate_remaining
@@ -131,6 +132,73 @@ async def get_weights_status(
         "offline_ready": n_available == len(YOLO_MODELS),
         "models": models_out,
     }
+
+
+# ── Worker health ─────────────────────────────────────────────────
+
+@router.get("/worker-status")
+async def get_worker_status():
+    """Check whether at least one Celery worker is reachable.
+
+    Uses a two-stage detection strategy so a worker that is busy running
+    a long YOLO training job (and therefore cannot respond to ping within
+    the normal 1-second window) is still correctly reported as available.
+
+    Stage 1 — ping (3 s timeout): fast path for idle workers.
+    Stage 2 — active() (5 s timeout): fallback for workers saturated with
+              GPU training that can't process a ping fast enough.
+    """
+    def _check() -> dict:
+        # Stage 1: ping with a generous timeout
+        try:
+            insp = celery_app.control.inspect(timeout=3.0)
+            ping_result = insp.ping() or {}
+            if ping_result:
+                active = insp.active() or {}
+                reserved = insp.reserved() or {}
+                active_count = sum(len(v) for v in active.values())
+                reserved_count = sum(len(v) for v in reserved.values())
+                return {
+                    "worker_available": True,
+                    "worker_busy": active_count > 0,
+                    "active_tasks": active_count,
+                    "reserved_tasks": reserved_count,
+                    "workers": list(ping_result.keys()),
+                    "detection": "ping",
+                }
+        except Exception:
+            pass
+
+        # Stage 2: active() — succeeds even when the worker is fully
+        # saturated with training because the management channel is
+        # separate from the task execution channel.
+        try:
+            insp = celery_app.control.inspect(timeout=5.0)
+            active = insp.active()
+            if active is not None:
+                active_count = sum(len(v) for v in active.values())
+                return {
+                    "worker_available": True,
+                    "worker_busy": active_count > 0,
+                    "active_tasks": active_count,
+                    "reserved_tasks": 0,
+                    "workers": list(active.keys()),
+                    "detection": "active",
+                }
+        except Exception:
+            pass
+
+        return {
+            "worker_available": False,
+            "worker_busy": False,
+            "active_tasks": 0,
+            "reserved_tasks": 0,
+            "workers": [],
+            "detection": "none",
+        }
+
+    result = await asyncio.get_event_loop().run_in_executor(None, _check)
+    return result
 
 
 # ── Training ──────────────────────────────────────────────────────

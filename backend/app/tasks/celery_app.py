@@ -27,4 +27,12 @@ celery_app.conf.update(
     task_soft_time_limit=3600,        # 1h soft limit → SoftTimeLimitExceeded
     task_time_limit=3900,             # 65min hard kill (15min grace after soft)
     worker_max_tasks_per_child=50,    # recycle worker to prevent memory leaks
+    # ── Worker heartbeat / events ─────────────────────────────────────────────
+    # These allow inspect().active() to detect a worker that is busy with
+    # GPU training and therefore cannot respond to ping() in time.
+    # Without these, the UI incorrectly reports "No Celery worker found"
+    # while training is visibly running in the terminal.
+    worker_send_task_events=True,   # worker proactively publishes task events
+    task_send_sent_event=True,      # event fired when a task is dispatched
+    worker_heartbeat=10,            # publish heartbeat every 10 s
 )
