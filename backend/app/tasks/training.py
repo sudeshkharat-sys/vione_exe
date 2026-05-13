@@ -16,11 +16,6 @@ import numpy as np
 
 
 def _resolve_model_path(model_name: str) -> str:
-    """
-    Return the full path to a pre-downloaded YOLO base weight if it exists in
-    yolo_weights_dir, otherwise fall back to *model_name* so ultralytics can
-    attempt an online download (useful in dev environments with internet).
-    """
     preloaded = settings.yolo_weights_dir / model_name
     if preloaded.exists() and preloaded.stat().st_size > 1024 * 1024:
         return str(preloaded)
@@ -28,7 +23,6 @@ def _resolve_model_path(model_name: str) -> str:
 
 
 def _safe_float(v):
-    """Convert a numeric value to a JSON-safe float (None for NaN/Inf)."""
     try:
         f = float(v)
         if math.isnan(f) or math.isinf(f):
@@ -39,53 +33,20 @@ def _safe_float(v):
 
 
 def _preprocess_for_inspection(src_path: Path, dst_path: Path) -> None:
-    """
-    Three-stage preprocessing pipeline tuned for water-pipe clip inspection.
-
-    Stage 1 — Aggressive CLAHE
-      clipLimit=4.0, tileGridSize=(4,4): smaller tiles mean tighter local
-      adaptation, so the white clip region is enhanced independently of the
-      surrounding dark rubber.  Higher clip limit allows more contrast gain
-      before clamping, making bright clip edges genuinely white rather than
-      just 'less dark'.
-
-    Stage 2 — Gamma correction (γ = 1.3)
-      γ > 1 darkens the shadow/midtone range, keeping the dark rubber
-      background dark.  This widens the perceived gap between the black
-      hose and the white plastic clip — the opposite of γ < 1 which
-      lifted dark areas and turned the rubber a flat grey.
-
-    Stage 3 — Unsharp mask sharpening
-      Subtracts a Gaussian-blurred copy from the original (weighted sum).
-      This crisp-ens the clip-to-rubber boundary — the hard edge between
-      white plastic and black hose is exactly the signal the model needs
-      to detect.
-
-    Falls back to a plain file copy if OpenCV cannot read the image.
-    """
     img = cv2.imread(str(src_path))
     if img is None:
         shutil.copy(src_path, dst_path)
         return
 
-    # ── Stage 1: moderate CLAHE on L channel ────────────────────
-    # clipLimit=3.0 + larger tiles (8×8): enhances local contrast without
-    # flattening the whole image into grey.
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     l_enhanced = clahe.apply(l_ch)
     out = cv2.cvtColor(cv2.merge([l_enhanced, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
-    # ── Stage 2: gamma correction (γ=1.3) ───────────────────────
-    # γ > 1 darkens shadows: keeps the dark rubber background dark so
-    # the white plastic clip stands out MORE (opposite of γ < 1 which
-    # lifted dark areas and turned rubber grey).
     lut = np.array([(i / 255.0) ** 1.3 * 255 for i in range(256)], dtype=np.uint8)
     out = cv2.LUT(out, lut)
 
-    # ── Stage 3: unsharp mask sharpening ────────────────────────
-    # Crispens the hard clip-to-rubber boundary.
     blurred = cv2.GaussianBlur(out, (0, 0), sigmaX=2.0)
     out = cv2.addWeighted(out, 1.4, blurred, -0.4, 0)
 
@@ -95,7 +56,6 @@ def _preprocess_for_inspection(src_path: Path, dst_path: Path) -> None:
 # ── Shared helpers ────────────────────────────────────────────────
 
 def _fetch_training_data(db, conn, project_id: str, status_filter: str = "annotated"):
-    """Read project + images (filtered by status) + all annotations in one session."""
     proj_rows = db.execute_query(
         conn,
         "SELECT id, classes FROM projects WHERE id = :project_id",
@@ -146,7 +106,6 @@ def _fetch_training_data(db, conn, project_id: str, status_filter: str = "annota
 
 
 def _group_annotations(ann_rows):
-    """Group raw annotation rows by image_id, normalising bbox type."""
     anns_by_image = defaultdict(list)
     for row in ann_rows:
         raw_bbox = row.get("bbox")
@@ -160,13 +119,6 @@ def _group_annotations(ann_rows):
 
 
 def _classify_image_quality(anns: list) -> str:
-    """
-    Classify an image's annotation quality based on annotation sources.
-
-    Returns 'manual', 'auto_high', or 'auto_review' — used to place images
-    in the right training split (manual → always train, auto_review → val
-    only or down-weighted).
-    """
     sources = {a.get("source", "manual") for a in anns}
     if "manual" in sources:
         return "manual"
@@ -177,21 +129,6 @@ def _classify_image_quality(anns: list) -> str:
 
 def _split_images(img_rows, train_ratio=0.8, val_ratio=0.15, seed=42,
                    anns_by_image=None):
-    """
-    Shuffle and split images into train / val / test subsets.
-
-    When *anns_by_image* is supplied the split is **quality-aware**:
-    manual-annotated images are prioritised for training (highest quality),
-    while ``auto_review`` images are pushed toward validation so the model
-    is evaluated against potentially noisier labels rather than memorising
-    them.  ``auto`` (high-confidence) images are treated like manual.
-
-    Rules
-    -----
-    - < 5 images  → everything in train; val mirrors train; no test
-    - 5–9 images  → 80 % train, 20 % val; no test
-    - ≥ 10 images → train_ratio train, val_ratio val, remainder test
-    """
     imgs = list(img_rows)
     rng = random.Random(seed)
     n = len(imgs)
@@ -200,7 +137,6 @@ def _split_images(img_rows, train_ratio=0.8, val_ratio=0.15, seed=42,
         rng.shuffle(imgs)
         return imgs, imgs, []
 
-    # Quality-aware ordering: manual first, then auto, then auto_review
     if anns_by_image:
         quality_order = {"manual": 0, "auto_high": 1, "auto_review": 2}
         imgs.sort(
@@ -208,7 +144,6 @@ def _split_images(img_rows, train_ratio=0.8, val_ratio=0.15, seed=42,
                 _classify_image_quality(anns_by_image.get(im["id"], [])), 1
             )
         )
-        # Shuffle within each quality tier to avoid deterministic bias
         manual_end = 0
         for i, im in enumerate(imgs):
             q = _classify_image_quality(anns_by_image.get(im["id"], []))
@@ -242,7 +177,6 @@ def _split_images(img_rows, train_ratio=0.8, val_ratio=0.15, seed=42,
 def _write_split(dataset_path, split_name, split_imgs, anns_by_image, classes,
                  preprocess: bool = True,
                  task=None, progress_offset: int = 0, progress_total: int = 0):
-    """Copy (and optionally CLAHE-enhance) images and write label files for one split."""
     (dataset_path / "images" / split_name).mkdir(parents=True, exist_ok=True)
     (dataset_path / "labels" / split_name).mkdir(parents=True, exist_ok=True)
 
@@ -259,7 +193,6 @@ def _write_split(dataset_path, split_name, split_imgs, anns_by_image, classes,
         else:
             shutil.copy(real_path, dest_path)
 
-        # Push preprocessing progress every 5 images (throttled to avoid Redis flood)
         if task and preprocess and progress_total > 0 and (idx + 1) % 5 == 0:
             current = progress_offset + idx + 1
             try:
@@ -291,24 +224,10 @@ def _write_split(dataset_path, split_name, split_imgs, anns_by_image, classes,
 def _build_yolo_dataset(img_rows, anns_by_image, classes, project_id,
                         train_ratio=0.8, val_ratio=0.15, preprocess=True, task=None):
     """
-    Build a YOLO dataset directory with proper train / val / test splits.
-
-    Always starts from a clean directory: any leftover files from a
-    previously interrupted run are removed first to prevent stale images
-    or label files contaminating the new split.
-
-    Directory layout
-    ----------------
-    temp_dataset_{project_id}/
-        images/
-            train/  val/  test/
-        labels/
-            train/  val/  test/
-        data.yaml
+    Build a YOLO dataset directory. Always wipes any leftover directory from
+    a previously interrupted run so stale files cannot contaminate the split.
     """
     dataset_path = Path(f"./temp_dataset_{project_id}")
-    # Remove any leftover directory from a previously interrupted run so
-    # stale images / labels from a different split cannot contaminate this run.
     if dataset_path.exists():
         shutil.rmtree(dataset_path, ignore_errors=True)
     dataset_path.mkdir(exist_ok=True)
@@ -320,7 +239,6 @@ def _build_yolo_dataset(img_rows, anns_by_image, classes, project_id,
 
     total = len(train_imgs) + len(val_imgs) + len(test_imgs)
 
-    # Announce preprocessing start so the UI shows phase immediately
     if task and preprocess and total > 0:
         try:
             task.update_state(
@@ -357,29 +275,28 @@ def _build_yolo_dataset(img_rows, anns_by_image, classes, project_id,
     return dataset_path, len(train_imgs), len(val_imgs), len(test_imgs)
 
 
-def _sync_job_status(task_id: str, status: str, result_meta: dict = None) -> None:
-    """Update the TrainingJob DB record to match the current Celery task state.
+def _sync_job_status(task_id: str, status: str) -> None:
+    """Update a stale TrainingJob DB record to the given status.
 
-    Called at the start of each training task so that jobs whose DB record
-    was left in 'pending' after an unexpected exe shutdown are corrected
-    before the task produces any new progress updates.
+    Uses execute_update (not execute_query) because this is a write.
+    Only updates records that are still in 'pending' or 'started' state
+    so a finished job is never accidentally overwritten.
+    Best-effort: any exception is swallowed so training is never blocked.
     """
     try:
         db = StateDBConnector()
         with db.get_session() as conn:
-            meta_json = json.dumps(result_meta or {})
-            db.execute_query(
+            db.execute_update(
                 conn,
-                "UPDATE training_jobs SET status = :status, result_meta = :meta "
+                "UPDATE training_jobs SET status = :status "
                 "WHERE id = :task_id AND status IN ('pending', 'started')",
-                {"status": status, "meta": meta_json, "task_id": task_id},
+                {"status": status, "task_id": task_id},
             )
     except Exception:
-        pass  # DB sync is best-effort; don't block training
+        pass
 
 
 def _make_epoch_callback(celery_task, total_epochs, epoch_history, epoch_start_times):
-    """Return an on_fit_epoch_end callback that pushes live metrics to Celery."""
     def on_fit_epoch_end(trainer):
         epoch = trainer.epoch + 1
 
@@ -445,23 +362,11 @@ def train_seed_model(
     preprocess: bool = True,
     batch: int = -1,
 ):
-    """
-    Quick seed-training on manually annotated images.
-    Synchronous — uses StateDBConnector (psycopg2), no asyncio event-loop conflict.
-
-    Phases
-    ------
-    1. DB reads  — project + images (annotated) + annotations
-    2. Dataset   — build YOLO directory on disk
-    3. Training  — YOLO model.train()
-    4. Cleanup   — copy seed_best.pt, remove temp dataset
-    """
-    # Sync any stale DB job record left over from a previous interrupted run
+    # Correct any stale DB record left from a previous interrupted run
     _sync_job_status(self.request.id, "started")
 
     db = StateDBConnector()
 
-    # ── Phase 1: DB reads ──────────────────────────────────────────
     with db.get_session() as conn:
         proj, classes, img_rows, ann_rows = _fetch_training_data(
             db, conn, project_id, status_filter="annotated"
@@ -474,13 +379,11 @@ def train_seed_model(
 
     anns_by_image = _group_annotations(ann_rows)
 
-    # ── Phase 2: Build dataset ────────────────────────────────────────
     dataset_path, n_train, n_val, n_test = _build_yolo_dataset(
         img_rows, anns_by_image, classes, project_id,
         preprocess=preprocess, task=self,
     )
 
-    # ── Phase 3: Train ──────────────────────────────────────────────
     total_epochs   = epochs
     epoch_history  = []
     epoch_start_times = []
@@ -498,10 +401,6 @@ def train_seed_model(
               "split": {"train": n_train, "val": n_val, "test": n_test}},
     )
 
-    # workers=0 is required for Celery daemonic processes; use cache=True so
-    # all images are loaded into RAM once before training begins, eliminating
-    # per-epoch disk I/O that would otherwise stall the GPU between batches.
-    # batch=0.85 targets 85% VRAM (vs the 60% default of batch=-1).
     _batch = 0.90 if batch == -1 else batch
 
     results = model.train(
@@ -509,41 +408,34 @@ def train_seed_model(
         epochs=total_epochs,
         imgsz=imgsz,
         batch=_batch,
-        cache=True,          # preload dataset into RAM — eliminates disk I/O stall with workers=0
-        amp=True,            # FP16 mixed precision — halves VRAM per tensor, faster tensor cores
-        device=0,            # explicit CUDA device
+        cache=True,
+        amp=True,
+        device=0,
         lr0=settings.seed_learning_rate,
-        lrf=0.01,            # final lr = lr0 * lrf
-        cos_lr=True,         # cosine LR schedule — smoother convergence on small datasets
+        lrf=0.01,
+        cos_lr=True,
         warmup_epochs=3,
-        weight_decay=0.001,  # stronger L2 regularisation to reduce overfitting
-        patience=20,         # early stopping — model converges fast on small datasets
-        label_smoothing=0.1, # reduces overconfidence on small datasets
-        # --- augmentation (tuned for bright-feature inspection) -----------
-        # Key insight: the OK/NOT-OK signal is the *visibility of the white
-        # plastic clip*.  Heavy brightness / saturation jitter destroys that
-        # signal.  We intentionally keep HSV jitter low so the model learns
-        # from the actual colour cue rather than fighting augmentation noise.
-        hsv_h=0.015,         # minimal hue jitter (lighting colour shifts)
-        hsv_s=0.3,           # reduced from 0.7 — preserve white-clip colour signature
-        hsv_v=0.2,           # reduced from 0.4 — preserve clip brightness contrast
-        degrees=10,          # slight rotation — clips appear at various angles
-        translate=0.1,       # random translation ± 10 %
-        scale=0.4,           # random scale ± 40 %
-        fliplr=0.5,          # horizontal flip (structurally valid for pipe clips)
-        flipud=0.1,          # occasional vertical flip
-        mosaic=0.5,          # reduced from 1.0 — avoid mixing OK+NOT-OK contexts
-        close_mosaic=15,     # disable mosaic for last 15 epochs to stabilise
-        mixup=0.0,           # disabled — pixel blending corrupts the binary signal
-        copy_paste=0.05,     # minimal copy-paste
-        # ------------------------------------------------------------------
+        weight_decay=0.001,
+        patience=20,
+        label_smoothing=0.1,
+        hsv_h=0.015,
+        hsv_s=0.3,
+        hsv_v=0.2,
+        degrees=10,
+        translate=0.1,
+        scale=0.4,
+        fliplr=0.5,
+        flipud=0.1,
+        mosaic=0.5,
+        close_mosaic=15,
+        mixup=0.0,
+        copy_paste=0.05,
         project=str(settings.model_dir / project_id),
         name="seed_model",
         verbose=False,
-        workers=0,           # Celery workers are daemonic — cannot spawn DataLoader subprocesses
+        workers=0,
     )
 
-    # ── Phase 4: Persist + cleanup ─────────────────────────────────────────
     best_model_path = results.save_dir / "weights" / "best.pt"
     target_path = settings.model_dir / project_id / "seed_best.pt"
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -577,24 +469,11 @@ def train_main_model(
     preprocess: bool = True,
     batch: int = -1,
 ):
-    """
-    Full/main training on ALL annotated images (manual + auto-annotated).
-    When use_seed_weights=True, fine-tunes from the existing seed_best.pt;
-    otherwise trains from the selected YOLO architecture.
-
-    Phases
-    ------
-    1. DB reads  — project + ALL annotated images + annotations
-    2. Dataset   — build YOLO directory on disk
-    3. Training  — YOLO model.train()
-    4. Cleanup   — copy main_best.pt, remove temp dataset
-    """
-    # Sync any stale DB job record left over from a previous interrupted run
+    # Correct any stale DB record left from a previous interrupted run
     _sync_job_status(self.request.id, "started")
 
     db = StateDBConnector()
 
-    # ── Phase 1: DB reads ──────────────────────────────────────────
     with db.get_session() as conn:
         proj, classes, img_rows, ann_rows = _fetch_training_data(
             db, conn, project_id, status_filter="annotated"
@@ -605,7 +484,6 @@ def train_main_model(
     if not img_rows:
         return {"error": "No annotated images found"}
 
-    # Resolve pretrained weights
     if use_seed_weights:
         seed_path = settings.model_dir / project_id / "seed_best.pt"
         if not seed_path.exists():
@@ -616,20 +494,15 @@ def train_main_model(
 
     anns_by_image = _group_annotations(ann_rows)
 
-    # ── Phase 2: Build dataset ────────────────────────────────────────
     dataset_path, n_train, n_val, n_test = _build_yolo_dataset(
         img_rows, anns_by_image, classes, f"{project_id}_main",
         preprocess=preprocess, task=self,
     )
 
-    # ── Phase 3: Train ──────────────────────────────────────────────
     total_epochs   = epochs
     epoch_history  = []
     epoch_start_times = []
 
-    # When fine-tuning from seed weights use a conservative LR to avoid
-    # catastrophic forgetting / hallucination; when training from scratch
-    # use the standard main LR.
     lr0 = (
         settings.main_learning_rate / 2
         if use_seed_weights
@@ -657,37 +530,34 @@ def train_main_model(
         epochs=total_epochs,
         imgsz=imgsz,
         batch=_batch,
-        cache=True,          # preload dataset into RAM — eliminates disk I/O stall with workers=0
-        amp=True,            # FP16 mixed precision — halves VRAM per tensor, faster tensor cores
-        device=0,            # explicit CUDA device
+        cache=True,
+        amp=True,
+        device=0,
         lr0=lr0,
-        lrf=0.01,            # final lr = lr0 * lrf
-        cos_lr=True,         # cosine LR schedule
+        lrf=0.01,
+        cos_lr=True,
         warmup_epochs=3,
-        weight_decay=0.001,  # stronger L2 regularisation
-        patience=20,         # early stopping — stop when mAP stops improving
+        weight_decay=0.001,
+        patience=20,
         label_smoothing=0.05,
-        # --- augmentation (same conservative tuning as seed) ---------------
         hsv_h=0.015,
-        hsv_s=0.3,           # reduced — preserve white-clip colour signature
-        hsv_v=0.2,           # reduced — preserve clip brightness contrast
+        hsv_s=0.3,
+        hsv_v=0.2,
         degrees=10,
         translate=0.1,
         scale=0.4,
         fliplr=0.5,
         flipud=0.1,
-        mosaic=0.5,          # reduced — avoid mixing OK+NOT-OK contexts
-        close_mosaic=10,     # disable mosaic for last 10 epochs to stabilise
-        mixup=0.0,           # disabled — pixel blending corrupts binary signal
-        copy_paste=0.1,      # increased — synthesises extra instances on small datasets
-        # ------------------------------------------------------------------
+        mosaic=0.5,
+        close_mosaic=10,
+        mixup=0.0,
+        copy_paste=0.1,
         project=str(settings.model_dir / project_id),
         name="main_model",
         verbose=False,
-        workers=0,           # Celery workers are daemonic — cannot spawn DataLoader subprocesses
+        workers=0,
     )
 
-    # ── Phase 4: Persist + cleanup ─────────────────────────────────────────
     best_model_path = results.save_dir / "weights" / "best.pt"
     target_path = settings.model_dir / project_id / "main_best.pt"
     target_path.parent.mkdir(parents=True, exist_ok=True)
