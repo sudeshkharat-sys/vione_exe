@@ -470,7 +470,7 @@ def train_seed_model(
     # all images are loaded into RAM once before training begins, eliminating
     # per-epoch disk I/O that would otherwise stall the GPU between batches.
     # batch=0.85 targets 85% VRAM (vs the 60% default of batch=-1).
-    _batch = 0.90 if batch == -1 else batch
+    _batch = 0.70 if batch == -1 else batch
 
     results = model.train(
         data=str(dataset_path / "data.yaml"),
@@ -479,7 +479,7 @@ def train_seed_model(
         batch=_batch,
         cache=True,          # preload dataset into RAM — eliminates disk I/O stall with workers=0
         amp=True,            # FP16 mixed precision — halves VRAM per tensor, faster tensor cores
-        device=0,            # explicit CUDA device
+        device="0" if __import__("torch").cuda.is_available() else "cpu",
         lr0=settings.seed_learning_rate,
         lrf=0.01,            # final lr = lr0 * lrf
         cos_lr=True,         # cosine LR schedule — smoother convergence on small datasets
@@ -615,7 +615,7 @@ def train_main_model(
               "split": {"train": n_train, "val": n_val, "test": n_test}},
     )
 
-    _batch = 0.90 if batch == -1 else batch
+    _batch = 0.70 if batch == -1 else batch
 
     results = model.train(
         data=str(dataset_path / "data.yaml"),
@@ -624,7 +624,7 @@ def train_main_model(
         batch=_batch,
         cache=True,          # preload dataset into RAM — eliminates disk I/O stall with workers=0
         amp=True,            # FP16 mixed precision — halves VRAM per tensor, faster tensor cores
-        device=0,            # explicit CUDA device
+        device="0" if __import__("torch").cuda.is_available() else "cpu",
         lr0=lr0,
         lrf=0.01,            # final lr = lr0 * lrf
         cos_lr=True,         # cosine LR schedule
