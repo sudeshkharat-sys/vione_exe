@@ -14,8 +14,7 @@ class Settings(BaseSettings):
     upload_dir: Path = Path("./data/uploads")
     model_dir: Path = Path("./data/models")
     # Pre-downloaded YOLO base weights for offline deployment.
-    # Populated during Docker build by scripts/download_yolo_weights.py.
-    # Not volume-mounted so weights survive container restarts without internet.
+    # Place weights here so training works without internet access.
     yolo_weights_dir: Path = Path("/app/data/yolo_weights")
 
     # ── Optional HF model paths ───────────────────────────────────────────────

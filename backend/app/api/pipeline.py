@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 import base64, io, cv2, numpy as np
+import redis as redis_lib
 from ..tasks.training import train_seed_model, train_main_model
 from ..tasks.auto_annotate import auto_annotate_remaining
 from ..tasks.ai_prompt import detect_with_prompt, bulk_detect_with_prompt
@@ -71,40 +72,20 @@ YOLO_MODELS = [
 
 @router.get("/available-models")
 async def get_available_models():
-    """Return the list of supported YOLO model weights for the UI dropdowns.
-
-    Each model entry now includes `available` (True when the weight is
-    pre-downloaded and offline-ready) and `size_mb` (file size in MB or None).
-    """
-    weights_dir = settings.yolo_weights_dir
+    """Return the list of supported YOLO model weights for the UI dropdowns."""
     families: dict = {}
-    models_out = []
     for m in YOLO_MODELS:
-        path = weights_dir / m["value"]
-        available = path.exists() and path.stat().st_size > 1024 * 1024
-        entry = {
-            **m,
-            "available": available,
-            "size_mb": round(path.stat().st_size / 1_048_576, 1) if available else None,
-        }
-        models_out.append(entry)
         families.setdefault(m["family"], []).append(
-            {"value": m["value"], "label": m["label"],
-             "available": available, "size_mb": entry["size_mb"]}
+            {"value": m["value"], "label": m["label"]}
         )
-    return {"models": models_out, "families": families}
+    return {"models": YOLO_MODELS, "families": families}
 
 
 @router.get("/weights-status")
 async def get_weights_status(
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Report which YOLO base weights are pre-downloaded and offline-ready.
-
-    Returns a per-model breakdown plus a summary so the frontend can show
-    a simple indicator (all green / some missing / none pre-loaded).
-    """
+    """Report which YOLO base weights are pre-downloaded and offline-ready."""
     weights_dir = settings.yolo_weights_dir
     models_out = []
     total_size_mb = 0.0
@@ -137,10 +118,22 @@ async def get_weights_status(
 
 class TrainSeedRequest(BaseModel):
     model_name: str = "yolo11s.pt"
+    custom_weights: Optional[str] = None
     epochs: int = 100
     imgsz: int = 640
     preprocess: bool = True
     batch: int = -1
+    aug_fliplr: float = 0.5
+    aug_flipud: float = 0.1
+    aug_mosaic: float = 0.5
+    aug_hsv_v: float = 0.4
+    aug_hsv_h: float = 0.015
+    aug_hsv_s: float = 0.3
+    aug_degrees: float = 10.0
+    aug_translate: float = 0.1
+    aug_scale: float = 0.4
+    aug_mixup: float = 0.0
+    aug_copy_paste: float = 0.05
 
 
 @router.post("/train-seed/{project_id}")
@@ -153,18 +146,33 @@ async def start_seed_training(
     await get_owned_project(project_id, current_user, db)
     req = body or TrainSeedRequest()
     task = train_seed_model.delay(
-        project_id, req.model_name, req.epochs, req.imgsz, req.preprocess, req.batch
+        project_id, req.model_name, req.epochs, req.imgsz, req.preprocess, req.batch,
+        req.custom_weights, req.aug_fliplr, req.aug_flipud, req.aug_mosaic, req.aug_hsv_v,
+        req.aug_hsv_h, req.aug_hsv_s, req.aug_degrees, req.aug_translate,
+        req.aug_scale, req.aug_mixup, req.aug_copy_paste,
     )
     return {"task_id": task.id, "status": "queued"}
 
 
 class TrainMainRequest(BaseModel):
     model_name: str = "yolo11s.pt"
+    custom_weights: Optional[str] = None
     epochs: int = 150
     use_seed_weights: bool = True
     imgsz: int = 640
     preprocess: bool = True
     batch: int = -1
+    aug_fliplr: float = 0.5
+    aug_flipud: float = 0.1
+    aug_mosaic: float = 0.5
+    aug_hsv_v: float = 0.4
+    aug_hsv_h: float = 0.015
+    aug_hsv_s: float = 0.3
+    aug_degrees: float = 10.0
+    aug_translate: float = 0.1
+    aug_scale: float = 0.4
+    aug_mixup: float = 0.0
+    aug_copy_paste: float = 0.1
 
 
 @router.post("/train-main/{project_id}")
@@ -178,9 +186,49 @@ async def start_main_training(
     req = body or TrainMainRequest()
     task = train_main_model.delay(
         project_id, req.model_name, req.epochs,
-        req.use_seed_weights, req.imgsz, req.preprocess, req.batch
+        req.use_seed_weights, req.imgsz, req.preprocess, req.batch,
+        req.custom_weights, req.aug_fliplr, req.aug_flipud, req.aug_mosaic, req.aug_hsv_v,
+        req.aug_hsv_h, req.aug_hsv_s, req.aug_degrees, req.aug_translate,
+        req.aug_scale, req.aug_mixup, req.aug_copy_paste,
     )
     return {"task_id": task.id, "status": "queued"}
+
+
+@router.post("/upload-weights/{project_id}")
+async def upload_custom_weights(
+    project_id: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await get_owned_project(project_id, current_user, db)
+    if not file.filename or not file.filename.endswith(".pt"):
+        raise HTTPException(status_code=400, detail="Only .pt files are supported.")
+    weights_dir = settings.model_dir / project_id / "custom_weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    target = weights_dir / file.filename
+    if target.exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"A model named '{file.filename}' already exists. Rename the file before uploading.",
+        )
+    content = await file.read()
+    target.write_bytes(content)
+    return {"filename": file.filename}
+
+
+@router.get("/custom-weights/{project_id}")
+async def list_custom_weights(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await get_owned_project(project_id, current_user, db)
+    weights_dir = settings.model_dir / project_id / "custom_weights"
+    if not weights_dir.exists():
+        return {"weights": []}
+    weights = sorted(f.name for f in weights_dir.glob("*.pt"))
+    return {"weights": weights}
 
 
 @router.get("/clahe-preview/{project_id}")
@@ -189,10 +237,6 @@ async def get_clahe_preview(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Return a before/after CLAHE preview using the first annotated image in the
-    project.  Both images are returned as base64-encoded JPEG data URIs.
-    """
     await get_owned_project(project_id, current_user, db)
 
     result = await db.execute(
@@ -295,7 +339,6 @@ async def trigger_ai_prompt(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Detect objects in a single image using a text prompt."""
     await get_owned_project(body.project_id, current_user, db)
     task = detect_with_prompt.delay(
         body.project_id, body.image_id, body.prompt, body.clear_existing
@@ -309,7 +352,6 @@ async def trigger_ai_bulk_prompt(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Detect objects in multiple images using a text prompt."""
     await get_owned_project(body.project_id, current_user, db)
     task = bulk_detect_with_prompt.delay(
         body.project_id, body.prompt, body.image_ids
@@ -323,7 +365,6 @@ async def get_pending_images(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return pending images AND annotated-but-empty images."""
     await get_owned_project(project_id, current_user, db)
 
     pending_q = await db.execute(
@@ -368,7 +409,6 @@ async def get_model_status(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Check whether trained seed/main models exist for this project."""
     await get_owned_project(project_id, current_user, db)
     seed_path = settings.model_dir / project_id / "seed_best.pt"
     main_path = settings.model_dir / project_id / "main_best.pt"
@@ -387,7 +427,6 @@ async def get_model_details(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return rich details about trained models for a project."""
     await get_owned_project(project_id, current_user, db)
 
     seed_path = settings.model_dir / project_id / "seed_best.pt"
@@ -435,7 +474,6 @@ async def download_model(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Stream the trained model weights file as a download."""
     await get_owned_project(project_id, current_user, db)
 
     if model_type not in ("seed", "main"):
@@ -482,7 +520,6 @@ async def start_scoring(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Score all pending images by uncertainty — returns ranked list."""
     await get_owned_project(project_id, current_user, db)
     req = body or ScoreImagesRequest()
     task = score_unlabeled_images.delay(
@@ -498,7 +535,6 @@ async def start_curriculum_annotate(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Smart auto-annotation with confidence tiers."""
     await get_owned_project(project_id, current_user, db)
     req = body or CurriculumAnnotateRequest()
     task = curriculum_auto_annotate.delay(
@@ -515,7 +551,6 @@ async def start_suggest_review(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get the top-N most uncertain images that need human annotation."""
     await get_owned_project(project_id, current_user, db)
     req = body or SuggestReviewRequest()
     task = suggest_for_review.delay(project_id, req.budget, req.strategy)
@@ -569,8 +604,7 @@ async def cancel_task(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Revoke a Celery task and mark the DB job record as stopped."""
-    # Verify the job belongs to the current user's project before cancelling
+    """Set Redis stop flag + revoke a Celery task and mark the DB job record as stopped."""
     result = await db.execute(select(TrainingJob).where(TrainingJob.id == task_id))
     job = result.scalar_one_or_none()
     if job:
@@ -583,7 +617,13 @@ async def cancel_task(
         if not proj_result.scalar_one_or_none():
             raise HTTPException(status_code=403, detail="Access denied")
 
-    celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+    try:
+        _r = redis_lib.from_url(settings.redis_url, socket_connect_timeout=1)
+        _r.setex(f"stop_training:{task_id}", 300, "1")
+    except Exception:
+        pass
+
+    celery_app.control.revoke(task_id, terminate=False)
 
     try:
         if job:
@@ -600,6 +640,81 @@ async def cancel_task(
     return {"task_id": task_id, "status": "revoked"}
 
 
+@router.post("/force-stop-all/{project_id}")
+async def force_stop_all(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Stop every running/queued task for a project and purge the broker queue."""
+    await get_owned_project(project_id, current_user, db)
+
+    result = await db.execute(
+        select(TrainingJob).where(
+            TrainingJob.project_id == project_id,
+            TrainingJob.status.in_(["pending", "started"]),
+        )
+    )
+    jobs = result.scalars().all()
+
+    try:
+        _r = redis_lib.from_url(settings.redis_url, socket_connect_timeout=2)
+    except Exception:
+        _r = None
+
+    stopped_ids = []
+    for job in jobs:
+        if _r:
+            try:
+                _r.setex(f"stop_training:{job.id}", 300, "1")
+            except Exception:
+                pass
+        celery_app.control.revoke(job.id, terminate=False)
+        job.status = "failure"
+        job.result_meta = _sanitize_meta({
+            **(job.result_meta or {}),
+            "error": "Stopped by user",
+        })
+        job.finished_at = datetime.utcnow()
+        stopped_ids.append(job.id)
+
+    _TRAINING_TASKS = {
+        "app.tasks.training.train_seed_model",
+        "app.tasks.training.train_main_model",
+        "app.tasks.auto_annotate.auto_annotate_remaining",
+    }
+    try:
+        active = celery_app.control.inspect(timeout=2).active() or {}
+        for worker_tasks in active.values():
+            for task_info in (worker_tasks or []):
+                tid  = task_info.get("id", "")
+                name = task_info.get("name", "")
+                args = task_info.get("args", [])
+                if (
+                    name in _TRAINING_TASKS
+                    and args
+                    and args[0] == project_id
+                    and tid not in stopped_ids
+                ):
+                    if _r:
+                        try:
+                            _r.setex(f"stop_training:{tid}", 300, "1")
+                        except Exception:
+                            pass
+                    celery_app.control.revoke(tid, terminate=False)
+                    stopped_ids.append(tid)
+    except Exception:
+        pass
+
+    try:
+        celery_app.control.purge()
+    except Exception:
+        pass
+
+    await db.commit()
+    return {"stopped": len(stopped_ids), "task_ids": stopped_ids}
+
+
 # ── Task status ───────────────────────────────────────────────────
 
 @router.get("/task-status/{task_id}")
@@ -608,7 +723,6 @@ async def get_task_status(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return Celery task progress. Auth required; task_id is opaque so no ownership re-check needed."""
     result = AsyncResult(task_id, app=celery_app)
     response = {
         "task_id": task_id,
@@ -663,7 +777,7 @@ class JobCreateRequest(BaseModel):
 class JobUpdateRequest(BaseModel):
     status: Optional[str] = None
     result_meta: Optional[dict] = None
-    finished_at: Optional[str] = None  # ISO-8601 string
+    finished_at: Optional[str] = None
 
 
 @router.post("/jobs")
@@ -672,7 +786,6 @@ async def create_job(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Persist a newly-submitted Celery job so it survives page reloads."""
     await get_owned_project(body.project_id, current_user, db)
     job = TrainingJob(
         id=body.task_id,
@@ -695,7 +808,6 @@ async def list_jobs(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return all persisted jobs for a project, oldest first."""
     await get_owned_project(project_id, current_user, db)
 
     q = select(TrainingJob).where(TrainingJob.project_id == project_id)
@@ -728,13 +840,11 @@ async def update_job(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update status and/or result_meta for a job."""
     result = await db.execute(select(TrainingJob).where(TrainingJob.id == task_id))
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {task_id} not found")
 
-    # Verify job belongs to the current user's project
     proj_result = await db.execute(
         select(Project).where(
             Project.id == job.project_id,
@@ -753,3 +863,26 @@ async def update_job(
 
     await db.commit()
     return {"id": job.id, "status": job.status}
+
+
+@router.delete("/jobs/{task_id}")
+async def delete_job(
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(TrainingJob).where(TrainingJob.id == task_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {task_id} not found")
+    proj_result = await db.execute(
+        select(Project).where(
+            Project.id == job.project_id,
+            Project.user_id == current_user.id,
+        )
+    )
+    if not proj_result.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Access denied")
+    await db.delete(job)
+    await db.commit()
+    return {"status": "deleted"}

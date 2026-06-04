@@ -1,84 +1,136 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from ..database import get_db
 from ..models.annotation import Annotation
 from ..models.image import Image
+from ..models.project import Project
 from ..models.user import User
-from ..schemas.base import AnnotationCreate, AnnotationResponse
 from ..api.auth import get_current_user
-from ..api.deps import get_owned_image, get_owned_annotation
-from typing import List
-from pydantic import BaseModel
-
-
-class ClassifyBody(BaseModel):
-    class_name: str
-
+from ..api.deps import get_owned_project
 
 router = APIRouter(prefix="/annotations", tags=["annotations"])
 
 
-@router.post("", response_model=AnnotationResponse)
+class AnnotationCreate(BaseModel):
+    image_id: str
+    class_name: str
+    bbox: List[float]
+    source: Optional[str] = "manual"
+
+
+class AnnotationUpdate(BaseModel):
+    class_name: Optional[str] = None
+    bbox: Optional[List[float]] = None
+    source: Optional[str] = None
+
+
+class BulkAnnotationCreate(BaseModel):
+    annotations: List[AnnotationCreate]
+    clear_existing: bool = False
+
+
+@router.post("")
 async def create_annotation(
-    data: AnnotationCreate,
+    annotation: AnnotationCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Verify the target image belongs to the current user
-    image = await get_owned_image(data.image_id, current_user, db)
+    result = await db.execute(select(Image).where(Image.id == annotation.image_id))
+    image = result.scalar_one_or_none()
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
 
-    annotation = Annotation(
-        image_id=data.image_id,
-        class_name=data.class_name,
-        bbox=data.bbox,
-        source=data.source,
+    await get_owned_project(image.project_id, current_user, db)
+
+    new_annotation = Annotation(
+        image_id=annotation.image_id,
+        class_name=annotation.class_name,
+        bbox=annotation.bbox,
+        source=annotation.source or "manual",
     )
-    db.add(annotation)
+    db.add(new_annotation)
+
     image.status = "annotated"
     await db.commit()
-    await db.refresh(annotation)
-    return annotation
+    await db.refresh(new_annotation)
+
+    return {
+        "id": new_annotation.id,
+        "image_id": new_annotation.image_id,
+        "class_name": new_annotation.class_name,
+        "bbox": new_annotation.bbox,
+        "source": new_annotation.source,
+    }
 
 
-@router.get("/image/{image_id}", response_model=List[AnnotationResponse])
-async def list_image_annotations(
+@router.get("/image/{image_id}")
+async def get_annotations(
     image_id: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await get_owned_image(image_id, current_user, db)
-    result = await db.execute(select(Annotation).where(Annotation.image_id == image_id))
-    return result.scalars().all()
+    result = await db.execute(select(Image).where(Image.id == image_id))
+    image = result.scalar_one_or_none()
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    await get_owned_project(image.project_id, current_user, db)
+
+    result = await db.execute(
+        select(Annotation).where(Annotation.image_id == image_id)
+    )
+    annotations = result.scalars().all()
+
+    return [
+        {
+            "id": ann.id,
+            "image_id": ann.image_id,
+            "class_name": ann.class_name,
+            "bbox": ann.bbox,
+            "source": ann.source,
+        }
+        for ann in annotations
+    ]
 
 
-@router.patch("/{annotation_id}/classify", response_model=AnnotationResponse)
-async def classify_annotation(
+@router.put("/{annotation_id}")
+async def update_annotation(
     annotation_id: str,
-    data: ClassifyBody,
+    update: AnnotationUpdate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Assign a class name to an AI-detected annotation and promote it to manual."""
-    ann = await get_owned_annotation(annotation_id, current_user, db)
-    ann.class_name = data.class_name
-    ann.source = "manual"
-    await db.commit()
-    await db.refresh(ann)
-    return ann
+    result = await db.execute(
+        select(Annotation).where(Annotation.id == annotation_id)
+    )
+    annotation = result.scalar_one_or_none()
+    if not annotation:
+        raise HTTPException(status_code=404, detail="Annotation not found")
 
+    result = await db.execute(select(Image).where(Image.id == annotation.image_id))
+    image = result.scalar_one_or_none()
+    await get_owned_project(image.project_id, current_user, db)
 
-@router.patch("/{annotation_id}/verify")
-async def verify_annotation(
-    annotation_id: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Mark an AI annotation as verified by changing source to 'manual'."""
-    ann = await get_owned_annotation(annotation_id, current_user, db)
-    ann.source = "manual"
+    if update.class_name is not None:
+        annotation.class_name = update.class_name
+    if update.bbox is not None:
+        annotation.bbox = update.bbox
+    if update.source is not None:
+        annotation.source = update.source
+
     await db.commit()
-    return {"status": "verified", "id": annotation_id}
+    await db.refresh(annotation)
+
+    return {
+        "id": annotation.id,
+        "image_id": annotation.image_id,
+        "class_name": annotation.class_name,
+        "bbox": annotation.bbox,
+        "source": annotation.source,
+    }
 
 
 @router.delete("/{annotation_id}")
@@ -87,20 +139,68 @@ async def delete_annotation(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete an annotation (used for 'Reject')."""
-    ann = await get_owned_annotation(annotation_id, current_user, db)
-    image_id = ann.image_id
-    await db.delete(ann)
-
-    # If no annotations remain, set image status back to pending
-    count_res = await db.execute(
-        select(Annotation).where(Annotation.image_id == image_id)
+    result = await db.execute(
+        select(Annotation).where(Annotation.id == annotation_id)
     )
-    if not count_res.scalars().first():
-        img_res = await db.execute(select(Image).where(Image.id == image_id))
-        img = img_res.scalar_one_or_none()
-        if img:
-            img.status = "pending"
+    annotation = result.scalar_one_or_none()
+    if not annotation:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+
+    result = await db.execute(select(Image).where(Image.id == annotation.image_id))
+    image = result.scalar_one_or_none()
+    await get_owned_project(image.project_id, current_user, db)
+
+    await db.delete(annotation)
+
+    remaining = await db.execute(
+        select(Annotation).where(Annotation.image_id == annotation.image_id)
+    )
+    if not remaining.scalars().all():
+        image.status = "pending"
 
     await db.commit()
     return {"status": "deleted"}
+
+
+@router.post("/bulk")
+async def bulk_create_annotations(
+    body: BulkAnnotationCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not body.annotations:
+        return {"created": 0}
+
+    image_ids = list({a.image_id for a in body.annotations})
+
+    for image_id in image_ids:
+        result = await db.execute(select(Image).where(Image.id == image_id))
+        image = result.scalar_one_or_none()
+        if not image:
+            raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
+        await get_owned_project(image.project_id, current_user, db)
+
+    if body.clear_existing:
+        await db.execute(
+            delete(Annotation).where(Annotation.image_id.in_(image_ids))
+        )
+
+    new_anns = []
+    for a in body.annotations:
+        ann = Annotation(
+            image_id=a.image_id,
+            class_name=a.class_name,
+            bbox=a.bbox,
+            source=a.source or "manual",
+        )
+        db.add(ann)
+        new_anns.append(ann)
+
+    for image_id in image_ids:
+        result = await db.execute(select(Image).where(Image.id == image_id))
+        image = result.scalar_one_or_none()
+        if image:
+            image.status = "annotated"
+
+    await db.commit()
+    return {"created": len(new_anns)}

@@ -21,7 +21,8 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     worker_prefetch_multiplier=1,
-    task_track_started=True,
+    task_track_started=True,          # emit STARTED state so UI shows "Running"
+    worker_pool="solo",               # Windows: avoids spawn-based prefork pool issues
     task_acks_late=True,              # re-queue task if worker crashes mid-run
     task_reject_on_worker_lost=True,  # don't drop tasks on hard worker crash
     task_soft_time_limit=3600,        # 1h soft limit → SoftTimeLimitExceeded
